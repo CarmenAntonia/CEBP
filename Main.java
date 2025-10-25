@@ -132,6 +132,30 @@ public class Main {
          }
     }
 
+    static final class Attack implements Action {
+        final int x, y;
+        final int attacker;
+        final long ts = System.currentTimeMillis();
+
+        Attack(int attacker, int x, int y) { 
+            this.attacker = attacker; 
+            this.x = x; 
+            this.y = y; 
+        }
+
+        public int playerId() { 
+            return attacker; 
+        }
+
+        public long timestamp() { 
+            return ts; 
+        }
+
+        public String toString() { 
+            return "Attack[p="+attacker+", ("+x+","+y+")]"; 
+        }
+    }
+
     static final class MatchState {
         final int width, height, players;
         final RegionType[][] regionMap;
@@ -141,6 +165,8 @@ public class Main {
         final int[] alive;
         int currentTurn;
         volatile int winner = -1;
+        final int[][] hitsOnCell; // 0..3; at 3 the house is destroyed
+        final int[] lightning; 
 
         final EnumMap<RegionType,int[]> buildCost = new EnumMap<>(RegionType.class);
         final Map<String, Offer> openOffers = new ConcurrentHashMap<>();
@@ -160,6 +186,9 @@ public class Main {
             for(int p = 0; p < players; p++) 
                 Arrays.fill(resources[p], 2);
             this.currentTurn = start;
+            this.hitsOnCell = new int[height][width];
+            this.lightning  = new int[players];
+            Arrays.fill(this.lightning, 2);
 
             putCost(RegionType.SKY, cost(1,1,0,2));
             putCost(RegionType.FOREST, cost(2,2,0,0));
@@ -262,25 +291,43 @@ public class Main {
                 handleTradeOffer(o);
             else if (a instanceof TradeAccept ac) 
                 handleTradeAccept(ac);
+            else if (a instanceof Attack atk) 
+                handleAttack(atk);
+        }
+
+        private int[] findAnyFreeCell() {
+            for (int y = 0; y < st.height; y++) {
+                for (int x = 0; x < st.width; x++) {
+                    if (st.houseOwner[y][x] == -1) 
+                        return new int[]{x, y};
+                }
+            }
+            return null;
         }
 
         private void handlePlace(PlaceStartingHouse a){
             int p = a.playerId;
-            if(!st.inBounds(a.x,a.y)) { 
-                reject(a,"OUT_OF_BOUNDS"); 
-                return; 
-            }
-            if(!st.isEmpty(a.x,a.y)) { 
-                reject(a,"TILE_OCCUPIED"); 
-                return; 
-            }
-            if(st.placedStartingHouse[p]) { 
-                reject(a,"ALREADY_PLACED_STARTING_HOUSE"); 
+
+            if (st.placedStartingHouse[p]) {
+                reject(a, "ALREADY_PLACED_STARTING_HOUSE");
                 return;
             }
-            st.houseOwner[a.y][a.x] = p;
+
+            int x = a.x, y = a.y;
+
+            if (!st.inBounds(x, y) || !st.isEmpty(x, y)) {
+                int[] cell = findAnyFreeCell();
+                if (cell == null) {            
+                    reject(a, "NO_FREE_CELL_AVAILABLE");
+                    return;
+                }
+                x = cell[0];
+                y = cell[1];
+            }
+
+            st.houseOwner[y][x] = p;
             st.placedStartingHouse[p] = true;
-            logOk(a,"Placed at ("+a.x+","+a.y+") in "+st.regionAt(a.x,a.y));
+            logOk(a, "Placed at (" + x + "," + y + ") in " + st.regionAt(x, y));
             checkVictory(p);
         }
 
@@ -419,6 +466,69 @@ public class Main {
             log("[TRADE] P"+off.from+" gave "+off.give+" ⇄ P"+a.to+" gave "+off.get+" (nonce="+a.id+")");
         }
 
+        private void handleAttack(Attack a) {
+            int p = a.attacker;
+            if (!st.inBounds(a.x, a.y)) { 
+                reject(a, "OUT_OF_BOUNDS"); 
+                return; 
+            }
+            int owner = st.houseOwner[a.y][a.x];
+            if (owner < 0) { 
+                reject(a, "NO_HOUSE_HERE"); 
+                return; 
+            }
+            if (owner == p) { 
+                reject(a, "CANNOT_ATTACK_OWN_HOUSE"); 
+                return; 
+            }
+            if (st.lightning[p] <= 0) { 
+                reject(a, "NO_LIGHTNING"); 
+                return; 
+            }
+
+            st.lightning[p]--;
+            st.hitsOnCell[a.y][a.x]++;
+
+            int hits = st.hitsOnCell[a.y][a.x];
+            logOk(a, "Hit "+hits+"/3 on ("+a.x+","+a.y+") owned by P"+owner);
+
+            if (hits >= 3) {
+                destroyHouse(a.x, a.y, owner);
+                st.hitsOnCell[a.y][a.x] = 0;
+            }
+        }
+
+        private void destroyHouse(int x, int y, int owner) {
+            st.houseOwner[y][x] = -1;
+            log("[ATTACK] House destroyed at ("+x+","+y+"), owner P"+owner);
+            if (countHouses(owner) == 0) {
+                st.alive[owner] = 0;
+                log("[ELIM] P"+owner+" eliminated (no houses left).");
+
+                int aliveCount = 0, last = -1;
+                for (int p=0; p<st.players; p++) 
+                    if (st.alive[p]==1) { 
+                        aliveCount++; 
+                        last = p; 
+                    }
+
+                if (aliveCount == 1) {
+                    st.winner = last;
+                    log("GAME OVER. Winner is P"+last+" (last surviving player).");
+                    running.set(false);
+                    return;
+                }
+            }
+        }
+
+        private int countHouses(int p) {
+            int c=0; 
+            for(int y = 0; y < st.height; y++) 
+                for(int x = 0; x<st.width; x++)
+                    if(st.houseOwner[y][x] == p) 
+                        c++;
+            return c;
+        }
 
         private void advanceTurn(){
             int next = st.currentTurn;
@@ -492,6 +602,10 @@ public class Main {
             }
 
             while(st.winner == -1) {
+                if (st.winner == -1 && rnd.nextDouble() < 0.30) {
+                    tryAttackSomewhere();
+                }
+
                 if(st.currentTurn == id) {
                     if(rnd.nextDouble() < 0.7) {
                         int[] cell = randomAffordableFreeCell();
@@ -589,6 +703,27 @@ public class Main {
             return null;
         }
 
+        private void tryAttackSomewhere() {
+            if (st.lightning[id] <= 0) return;
+
+            int[] target = null;
+            for (int pass = 2; pass >= 0 && target == null; pass--) {
+                for (int y = 0; y < st.height; y++) {
+                    for (int x = 0; x < st.width; x++) {
+                        int owner = st.houseOwner[y][x];
+                        if (owner >= 0 && owner != id && st.hitsOnCell[y][x] == pass) {
+                            target = new int[]{x,y};
+                            if (pass == 2) break;
+                        }
+                    }
+                    if (target != null && st.hitsOnCell[target[1]][target[0]] == 2) break;
+                }
+            }
+            if (target != null) {
+                engine.submit(new Attack(id, target[0], target[1]));
+            }
+        }
+
         private void sleep(int lo,int hi){
             try { 
                 Thread.sleep(lo + rnd.nextInt(Math.max(1,hi-lo))); 
@@ -627,7 +762,7 @@ public class Main {
         RegionType[][] map = players < 5 ? createMapLessThan5Players() : createMapMoreThan4Players();
         final int height = map.length;
         final int width  = map[0].length;
-        
+
         LinkedBlockingQueue<Action> q = new LinkedBlockingQueue<>();
         MatchState st = new MatchState(width, height, players, map,0);
         Game engine = new Game(q, st);
@@ -646,8 +781,30 @@ public class Main {
         ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
         scheduler.scheduleAtFixedRate(() -> engine.submit(new ResourceGain()), 2, 2, TimeUnit.SECONDS);
 
+        ScheduledExecutorService lightningScheduler = Executors.newSingleThreadScheduledExecutor();
+        lightningScheduler.scheduleAtFixedRate(() -> {
+            boolean allEmpty = true;
+
+            for (int p = 0; p < st.players; p++) {
+                if (st.alive[p] == 1 && st.lightning[p] > 0) {
+                    allEmpty = false;
+                    break;
+                }
+            }
+
+            if (allEmpty) {
+                for (int p = 0; p < st.players; p++) {
+                    if (st.alive[p] == 1) {
+                        st.lightning[p] += 1;
+                        System.out.println("[LIGHTNING] Global recharge: Player " + p + " gains +1 lightning.");
+                    }
+                }
+            }
+        }, 20, 20, TimeUnit.SECONDS);
+
         engineThread.join();
         scheduler.shutdownNow();
+        lightningScheduler.shutdownNow();
         for(Thread t: bots) 
             t.join(200);
 

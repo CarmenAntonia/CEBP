@@ -81,6 +81,57 @@ public class Main {
         }
     }
 
+    static final class TradeOffer implements Action {
+        final int from, to;
+        final ResourceType give, get;
+        final String id;       
+        final long createdAtMs;
+
+        TradeOffer(int from, int to, ResourceType give, ResourceType get, String id) {
+            this.from = from; 
+            this.to = to; 
+            this.give = give; 
+            this.get = get;
+            this.id = id; 
+            this.createdAtMs = System.currentTimeMillis();
+        }
+
+        public int playerId() { 
+            return from; 
+        }
+
+        public long timestamp() { 
+            return createdAtMs; 
+        }
+
+        public String toString() {
+            return "TradeOffer[from=P"+from+" → to=P"+to+", give="+give+", get="+get+", id="+id+"]";
+        }
+    }
+
+    static final class TradeAccept implements Action {
+        final int to;                
+        final String id;         
+        final long ts = System.currentTimeMillis();
+
+        TradeAccept(int to, String id) { 
+            this.to = to; 
+            this.id = id; 
+        }
+
+        public int playerId() { 
+            return to; 
+        }
+
+        public long timestamp() { 
+            return ts; 
+        }
+
+        public String toString() { 
+            return "TradeAccept[to=P"+to+", id="+id+"]"; 
+         }
+    }
+
     static final class MatchState {
         final int width, height, players;
         final RegionType[][] regionMap;
@@ -92,6 +143,7 @@ public class Main {
         volatile int winner = -1;
 
         final EnumMap<RegionType,int[]> buildCost = new EnumMap<>(RegionType.class);
+        final Map<String, Offer> openOffers = new ConcurrentHashMap<>();
 
         MatchState(int width,int height,int players,RegionType[][] map,int start) {
             this.width=width; 
@@ -140,6 +192,20 @@ public class Main {
         RegionType regionAt(int x,int y){ 
             return regionMap[y][x]; 
         }
+
+        static final class Offer {
+            final int from, to;  //to = -1  public, else target player
+            final ResourceType give, get;
+            final long createdAtMs;
+
+            Offer(int from, int to, ResourceType give, ResourceType get, long createdAtMs) {
+                this.from = from; 
+                this.to = to; 
+                this.give = give; 
+                this.get = get; 
+                this.createdAtMs = createdAtMs;
+            }
+        }
     }
 
     static final class Game implements Runnable {
@@ -147,6 +213,7 @@ public class Main {
         private final MatchState st;
         private final AtomicBoolean running = new AtomicBoolean(true);
         private final Random rnd = new Random(42);
+        private static final long TRADE_TTL_MS = 20000L;
 
         Game(LinkedBlockingQueue<Action> q, MatchState st) {
             this.q = q; 
@@ -191,6 +258,10 @@ public class Main {
                 handleEndTurn(et);
             else if(a instanceof ResourceGain)        
                 handleResourceGain();
+            else if (a instanceof TradeOffer o)  
+                handleTradeOffer(o);
+            else if (a instanceof TradeAccept ac) 
+                handleTradeAccept(ac);
         }
 
         private void handlePlace(PlaceStartingHouse a){
@@ -237,6 +308,15 @@ public class Main {
             st.houseOwner[a.y][a.x] = p;
             logOk(a,"Built at ("+a.x+","+a.y+") in "+r);
             checkVictory(p);
+
+            //printHouse
+            System.out.println("\n");
+            for(int i = 0; i< st.height; i++){
+                for(int j = 0; j< st.width; j++)
+                    System.out.print(st.houseOwner[i][j]+ " ");
+                System.out.println();
+            }
+            System.out.println("\n");
         }
 
         private void handleEndTurn(EndTurn a){
@@ -302,6 +382,43 @@ public class Main {
                 sb.append("no houses yet");
             System.out.println(sb.toString());
         }
+
+        private void handleTradeOffer(TradeOffer a) {
+            if (a.to < -1 || a.to >= st.players) { reject(a, "INVALID_PLAYER"); return; }
+            if (a.from == a.to && a.to != -1)     { reject(a, "CANNOT_TRADE_WITH_SELF"); return; }
+            if (st.openOffers.containsKey(a.id)) { reject(a, "NONCE_ALREADY_EXISTS"); return; }
+
+            st.openOffers.put(a.id, new MatchState.Offer(a.from, a.to, a.give, a.get, a.createdAtMs));
+            logOk(a, (a.to == -1) ? "Public offer: P"+a.from+" gives "+a.give+" for "+a.get
+                : "Offer to P"+a.to+": P"+a.from+" gives "+a.give+" for "+a.get);
+        }
+
+        private void handleTradeAccept(TradeAccept a) {
+            MatchState.Offer off = st.openOffers.remove(a.id);
+            if (off == null) { reject(a, "OFFER_NOT_FOUND"); return; }
+
+            if (off.to != -1 && off.to != a.to) { reject(a, "NOT_TARGET_OF_OFFER"); return; }
+
+            if (System.currentTimeMillis() - off.createdAtMs > TRADE_TTL_MS) {
+                reject(a, "OFFER_EXPIRED"); return;
+            }
+
+            if (st.resources[off.from][off.give.ordinal()] < 1) { 
+                reject(a, "OFFER_OWNER_LACKS_"+off.give); return; 
+            }
+            if (st.resources[a.to][off.get.ordinal()] < 1) { 
+                reject(a, "ACCEPTER_LACKS_"+off.get); return; 
+            }
+
+            st.resources[off.from][off.give.ordinal()] -= 1;
+            st.resources[a.to][off.give.ordinal()]     += 1;
+
+            st.resources[a.to][off.get.ordinal()]      -= 1;
+            st.resources[off.from][off.get.ordinal()]  += 1;
+
+            log("[TRADE] P"+off.from+" gave "+off.give+" ⇄ P"+a.to+" gave "+off.get+" (nonce="+a.id+")");
+        }
+
 
         private void advanceTurn(){
             int next = st.currentTurn;
@@ -385,6 +502,38 @@ public class Main {
                     } else {
                         engine.submit(new EndTurn(id));
                     }
+
+                    if (rnd.nextDouble() < 0.80) {
+                        ResourceType give = surplusType();   
+                        ResourceType get  = deficitType();
+                        if (give != null && get != null && give != get) {
+                            engine.submit(new TradeOffer(id, -1, give, get, newNonce()));
+                        }
+                    }
+
+                    if (rnd.nextDouble() < 0.60) {
+                        final long NOW = System.currentTimeMillis();
+                        for (Map.Entry<String, MatchState.Offer> e : st.openOffers.entrySet()) {
+                            MatchState.Offer off = e.getValue();
+
+                            if (!(off.to == -1 || off.to == id)) continue;
+
+                            if (off.from == id) continue;
+
+                            boolean alive = NOW - off.createdAtMs <= 5000L;
+                            if (!alive) continue;
+
+                            boolean canPay = st.resources[id][off.get.ordinal()] >= 1;
+                            if (!canPay) continue;
+
+                            boolean want = st.resources[id][off.give.ordinal()] <= 2;
+                            if (!want) continue;
+
+                            engine.submit(new TradeAccept(id, e.getKey()));
+                            break;
+                        }
+                    }
+
                     sleep(80,160);
                 } else {
                     sleep(60,120);
@@ -424,6 +573,22 @@ public class Main {
             return true;
         }
 
+        private String newNonce() { return id + "-" + System.nanoTime(); }
+
+        private ResourceType surplusType() {
+            for (ResourceType r : ResourceType.values()) 
+                if (st.resources[id][r.ordinal()] > 3) 
+                    return r;
+            return null;
+        }
+
+        private ResourceType deficitType() {
+            for (ResourceType r : ResourceType.values()) 
+                if (st.resources[id][r.ordinal()] <= 1) 
+                    return r;
+            return null;
+        }
+
         private void sleep(int lo,int hi){
             try { 
                 Thread.sleep(lo + rnd.nextInt(Math.max(1,hi-lo))); 
@@ -431,11 +596,20 @@ public class Main {
         }
     }
 
-    static RegionType[][] createMap(){
+    static RegionType[][] createMapLessThan5Players(){
         return new RegionType[][] {
             { RegionType.SKY,    RegionType.FOREST,    RegionType.WATERS,    RegionType.VILLAGES, RegionType.MOUNTAINS },
             { RegionType.FOREST, RegionType.WATERS,    RegionType.MOUNTAINS, RegionType.SKY,      RegionType.VILLAGES  },
             { RegionType.WATERS, RegionType.MOUNTAINS, RegionType.SKY,       RegionType.FOREST,   RegionType.VILLAGES  }
+        };
+    }
+
+    static RegionType[][] createMapMoreThan4Players() {
+        return new RegionType[][] {
+            { RegionType.SKY,       RegionType.FOREST,   RegionType.WATERS,   RegionType.VILLAGES,  RegionType.MOUNTAINS },
+            { RegionType.FOREST,    RegionType.WATERS,   RegionType.MOUNTAINS,RegionType.SKY,       RegionType.VILLAGES  },
+            { RegionType.WATERS,    RegionType.MOUNTAINS,RegionType.SKY,      RegionType.FOREST,    RegionType.VILLAGES  },
+            { RegionType.MOUNTAINS, RegionType.SKY,      RegionType.FOREST,   RegionType.WATERS,    RegionType.VILLAGES  }
         };
     }
 
@@ -449,9 +623,11 @@ public class Main {
 
     public static void main(String[] args) throws Exception {
         final int players = (args.length > 0) ? Math.max(2, Math.min(8, parseInt(args[0], 4))) : 4;
-        final int width = 5, height = 3;
 
-        RegionType[][] map = createMap();
+        RegionType[][] map = players < 5 ? createMapLessThan5Players() : createMapMoreThan4Players();
+        final int height = map.length;
+        final int width  = map[0].length;
+        
         LinkedBlockingQueue<Action> q = new LinkedBlockingQueue<>();
         MatchState st = new MatchState(width, height, players, map,0);
         Game engine = new Game(q, st);
